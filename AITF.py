@@ -8,6 +8,7 @@ import csv
 import Levenshtein
 from keras.models import load_model
 import logging
+from sklearn.preprocessing import StandardScaler
 from keras.layers import Dense
 from keras.models import Sequential
 
@@ -20,11 +21,15 @@ X = data.drop(columns=['prognosis'])
 y = data['prognosis']
 label_encoder = LabelEncoder()
 y_encoded = label_encoder.fit_transform(y)
-onehot_encoder = OneHotEncoder(sparse=False)
+onehot_encoder = OneHotEncoder(sparse_output=False)
 y_encoded = onehot_encoder.fit_transform(y_encoded.reshape(-1, 1))
 
+# Scale the features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
 
-X_train, X_val, y_train, y_val = train_test_split(X, y_encoded, test_size=0.2, random_state=42)
+# Split the data
+X_train, X_val, y_train, y_val = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
 
 
 model = tf.keras.Sequential([
@@ -90,12 +95,14 @@ def create_model():
 
 
 class ModelUpdater:
-    def __init__(self, model, X_train, y_train, label_encoder, onehot_encoder):
+    def __init__(self, model, X_train, y_train, label_encoder, onehot_encoder, feedback_threshold=2):
         self.model = model
         self.X_train = X_train
         self.y_train = y_train
         self.label_encoder = label_encoder
         self.onehot_encoder = onehot_encoder
+        self.feedback_counter = 0  # Initialize feedback counter
+        self.feedback_threshold = feedback_threshold  # Threshold to trigger re-tuning
 
     def preprocess_feedback_X(self, feedback_X):
         num_samples_before = len(feedback_X)
@@ -110,6 +117,7 @@ class ModelUpdater:
 
         if len(feedback_X) != num_samples_before:
             raise ValueError(f"preprocess_feedback_X altered the number of samples: Before({num_samples_before}), After({len(feedback_X)})")
+        feedback_X = scaler.transform(feedback_X)
 
         return feedback_X
 
@@ -214,7 +222,7 @@ def cli_interface(model_updater):
         suggest_similar_symptoms(symptom)
 
     while True:
-        feedback = input("Is the prediction correct? (yes/no): ").lower()
+        feedback = input("Is the prediction correct? (yes/no/unconfirmed): ").lower()
         if feedback == 'no':
             correct_prognosis = input("Please enter the correct prognosis: ")
             symptoms = symptoms_to_vector(corrected_symptoms)
@@ -224,6 +232,9 @@ def cli_interface(model_updater):
             break
         elif feedback == 'yes':
             print("Thank you for confirming!")
+            break
+        elif feedback == 'unconfirmed':
+            print("No data collected")
             break
         else:
             print("Invalid response. Please respond with 'yes' or 'no'.")
@@ -254,11 +265,12 @@ if __name__ == "__main__":
 
 
 
+
 #checklist:
-#Memory/x
-#Feedback1/2 do corona
-#tune perameters optuna/x
-#symtomChecker/x
+#Memory///X
+#Feedback///X
+#tune perameters optuna//X
+#symtomChecker///X
 #sevarityScore
 #probabilityScore
 ##outputCalculator

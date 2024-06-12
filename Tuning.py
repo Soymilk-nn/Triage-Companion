@@ -1,111 +1,94 @@
 import optuna
 import tensorflow as tf
-import json
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
+import os
 
+class MedicalPrognosisModel:
+    def __init__(self, data_filepath, feedback_filepath, model_filepath='Hannah_updated.h5', tuning_threshold=50):
+        self.data_filepath = os.path.expanduser(data_filepath)
+        self.feedback_filepath = os.path.expanduser(feedback_filepath)
+        self.model_filepath = model_filepath
+        self.tuning_threshold = tuning_threshold
+        self.label_encoder = LabelEncoder()
+        self.onehot_encoder = OneHotEncoder(sparse_output=False)
+        self.model = None
+        self.scaler = StandardScaler()
+        self.load_data()
+        self.prepare_model()
 
+    def load_data(self):
+        data = pd.read_csv(self.data_filepath)
+        if data.empty:
+            raise ValueError("No data loaded. Check the file path and contents.")
+        data.dropna(axis=1, how='all', inplace=True)
+        numerical_cols = data.select_dtypes(include=['float64', 'int64']).columns
+        data[numerical_cols] = data[numerical_cols].fillna(data[numerical_cols].mean())
+        categorical_cols = data.select_dtypes(include=['object']).columns
+        data[categorical_cols] = data[categorical_cols].fillna(data[categorical_cols].mode().iloc[0])
+        if 'severity_score' in data.columns:
+            data.drop(columns=['severity_score'], inplace=True)
+        X = data.drop(columns=['prognosis'])
+        y = data['prognosis']
+        self.label_encoder.fit(y)
+        y_encoded = self.onehot_encoder.fit_transform(self.label_encoder.transform(y).reshape(-1, 1))
+        X_scaled = self.scaler.fit_transform(X)
+        self.X_train, self.X_val, self.y_train, self.y_val = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
 
-def load_and_preprocess_data(filepath, label_encoder=None, onehot_encoder=None, fit_encoders=False):
-    data = pd.read_csv(filepath)
+    def prepare_model(self):
+        best_params = self.tune_hyperparameters(self.X_train, self.y_train)
+        self.model = self.build_model(best_params)
 
-    # Drop 'severity_score' column if it exists
-    if 'severity_score' in data.columns:
-        data.drop(columns=['severity_score'], inplace=True)
-
-    X = data.drop(columns=['prognosis'])
-    y = data['prognosis']
-
-    if fit_encoders:
-        # Fit the encoders on the combined data
-        label_encoder.fit(y)
-        onehot_encoder.fit(label_encoder.transform(y).reshape(-1, 1))
-
-    # Encoding the target
-    y_encoded = onehot_encoder.transform(label_encoder.transform(y).reshape(-1, 1)).toarray()
-
-    return X, y_encoded
-
-
-def load_feedback_data(feedback_file_path):
-    feedback_data = pd.read_csv(feedback_file_path)
-    # Additional preprocessing steps as needed
-    return feedback_data
-
-class HyperparameterOptimizer:
-    def __init__(self, X_train, y_train, X_val, y_val):
-        self.X_train = X_train
-        self.y_train = y_train
-        self.X_val = X_val
-        self.y_val = y_val
-
-    def objective(self, trial):
-        # Suggest hyperparameters
-        n_layers = trial.suggest_int('n_layers', 1, 5)
-        dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.3)
-        learning_rate = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
-        units = trial.suggest_categorical('units', [32, 64, 128, 256])
-
-        # Model building
-        model = tf.keras.Sequential()
-        model.add(tf.keras.layers.Dense(units=units, activation='relu', input_dim=self.X_train.shape[1]))
-        model.add(tf.keras.layers.Dropout(dropout_rate))
-        for _ in range(n_layers - 1):
-            model.add(tf.keras.layers.Dense(units=units, activation='relu'))
-            model.add(tf.keras.layers.Dropout(dropout_rate))
-        model.add(tf.keras.layers.Dense(self.y_train.shape[1], activation='softmax'))
-
-        # Compile the model with legacy optimizer for M1/M2 Macs
-        optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=learning_rate)
-        model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
-
-        # Fit the model
-        early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-        model.fit(self.X_train, self.y_train, validation_data=(self.X_val, self.y_val), epochs=50, batch_size=32,
-                  verbose=0, callbacks=[early_stopping])
-
-        # Evaluate the model
-        loss, accuracy = model.evaluate(self.X_val, self.y_val, verbose=0)
-        return accuracy
-
-    def optimize(self, n_trials=100):
+    def tune_hyperparameters(self, X, y):
+        def objective(trial):
+            n_layers = trial.suggest_int('n_layers', 1, 3)
+            units = trial.suggest_categorical('units', [32, 64, 128])
+            dropout_rate = trial.suggest_float('dropout_rate', 0.2, 0.5)
+            learning_rate = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+            model = tf.keras.Sequential([
+                tf.keras.layers.Dense(units, activation='relu', input_dim=X.shape[1], kernel_initializer='he_normal'),
+                tf.keras.layers.Dropout(dropout_rate)] +
+                [layer for _ in range(n_layers - 1) for layer in (tf.keras.layers.Dense(units, activation='relu', kernel_initializer='he_normal'), tf.keras.layers.Dropout(dropout_rate))] +
+                [tf.keras.layers.Dense(y.shape[1], activation='softmax')])
+            optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=learning_rate)
+            model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+            es = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+            model.fit(X, y, validation_split=0.2, epochs=100, batch_size=32, callbacks=[es], verbose=0)
+            _, accuracy = model.evaluate(self.X_val, self.y_val, verbose=0)
+            return accuracy
         study = optuna.create_study(direction='maximize')
-        study.optimize(self.objective, n_trials=n_trials)
+        study.optimize(objective, n_trials=10)
+        return study.best_trial.params
 
-        print("Best hyperparameters: {}".format(study.best_trial.params))
-        with open('best_hyperparams.json', 'w') as f:
-            json.dump(study.best_trial.params, f)
+    def build_model(self, params):
+        model = tf.keras.Sequential([
+            tf.keras.layers.Dense(params['units'], activation='relu', input_dim=self.X_train.shape[1], kernel_initializer='he_normal'),
+            tf.keras.layers.Dropout(params['dropout_rate'])] +
+            [layer for _ in range(params['n_layers'] - 1) for layer in (tf.keras.layers.Dense(params['units'], activation='relu', kernel_initializer='he_normal'), tf.keras.layers.Dropout(params['dropout_rate']))] +
+            [tf.keras.layers.Dense(self.y_train.shape[1], activation='softmax')])
+        optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=params['lr'])
+        model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+        return model
 
-
-
+    def update_model_with_feedback(self):
+        feedback_data = pd.read_csv(self.feedback_filepath)
+        feedback_data.dropna(subset=['prognosis'], inplace=True)
+        feedback_X = feedback_data.drop(columns=['prognosis'])
+        feedback_y = feedback_data['prognosis']
+        feedback_y_encoded = self.onehot_encoder.transform(self.label_encoder.transform(feedback_y).reshape(-1, 1))
+        feedback_X_scaled = self.scaler.transform(feedback_X)
+        self.X_train = np.concatenate([self.X_train, feedback_X_scaled])
+        self.y_train = np.concatenate([self.y_train, feedback_y_encoded])
+        if feedback_data.shape[0] >= self.tuning_threshold:
+            best_params = self.tune_hyperparameters(self.X_train, self.y_train)
+            self.model = self.build_model(best_params)
+        self.model.fit(self.X_train, self.y_train, epochs=50, batch_size=32)
+        self.model.save(self.model_filepath)
 
 if __name__ == "__main__":
-    # Create encoders
-    label_encoder = LabelEncoder()
-    onehot_encoder = OneHotEncoder()
-
-    # Load and combine target variables to fit encoders
-    original_target = pd.read_csv('~/desktop/HannahP1_Dataset/Training-Training.csv')['prognosis']
-    feedback_target = pd.read_csv('~/desktop/HannahP1_Dataset/Feedback.csv')['prognosis']
-    combined_target = pd.concat([original_target, feedback_target])
-
-    # Fit encoders on combined target
-    label_encoder.fit(combined_target)
-    onehot_encoder.fit(label_encoder.transform(combined_target).reshape(-1, 1))
-
-    # Preprocess original and feedback data
-    original_X, original_y = load_and_preprocess_data('~/desktop/HannahP1_Dataset/Training-Training.csv', label_encoder, onehot_encoder)
-    feedback_X, feedback_y = load_and_preprocess_data('~/desktop/HannahP1_Dataset/Feedback.csv', label_encoder, onehot_encoder)
-
-    # Split original data
-    X_train, X_val, y_train, y_val = train_test_split(original_X, original_y, test_size=0.2, random_state=42)
-
-    # Combine feedback data with training data
-    X_train = pd.concat([X_train, feedback_X])
-    y_train = np.concatenate([y_train, feedback_y])
-    # Hyperparameter optimization
-    optimizer = HyperparameterOptimizer(X_train, y_train, X_val, y_val)
-    number_of_trials = 100  # Define the number of trials
-    optimizer.optimize(n_trials=number_of_trials)
+    data_filepath = '~/desktop/HannahP1_Dataset/Training-Training.csv'
+    feedback_filepath = '~/desktop/HannahP1_Dataset/Feedback.csv'
+    model = MedicalPrognosisModel(data_filepath, feedback_filepath)
+    model.update_model_with_feedback()
